@@ -9,7 +9,6 @@
 // which the client accepts: it resolves deltas only when the server sends them.
 
 import {
-  collectReachable,
   isObjectId,
   parseCommit,
   parseTag,
@@ -95,6 +94,7 @@ export function buildUploadPackAdvertisementV0(ctx: UploadPackContext): Buffer {
     'ofs-delta',
     'shallow',
     'multi_ack',
+    'multi_ack_detailed',
     'no-progress',
     `symref=HEAD:${headTarget}`,
     `agent=${UPLOAD_PACK_AGENT}`,
@@ -160,7 +160,7 @@ function wantCommits(
     } else if (object.type === 'commit') {
       queue.push({ oid: want, depth: 1 });
     } else {
-      // A want naming a tree/blob directly: not a commit walk; handled by collectReachable below.
+      // A want naming a tree/blob directly: not a commit walk; handled by collectTreeClosure below.
       queue.push({ oid: want, depth: 1 });
     }
   }
@@ -180,9 +180,43 @@ function wantCommits(
 }
 
 /**
- * Objects the client already holds, from its haves: the full closure of each have commit —
- * but the walk stops at the client's shallow boundaries, whose parents the client does NOT
- * hold. Tag haves resolve through to their target.
+ * Object closure WITHOUT following commit parents: commit -> its tree only, tag ->
+ * its target, tree -> entries, blob -> nothing. Used for fetch planning, where the
+ * commit set is already capped by `deepen` / the have walk and must not re-expand
+ * through history (collectReachable follows parents and would undo both caps).
+ */
+function collectTreeClosure(
+  roots: Iterable<string>,
+  lookup: (oid: string) => GitObject | undefined,
+): Set<string> {
+  const seen = new Set<string>();
+  const queue: string[] = [];
+  for (const root of roots) if (isObjectId(root)) queue.push(root);
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) continue;
+    seen.add(oid);
+    if (object.type === 'commit') {
+      queue.push(parseCommit(object.body).tree);
+    } else if (object.type === 'tag') {
+      queue.push(parseTag(object.body).object);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.body)) {
+        if (entry.mode === '160000') continue;
+        queue.push(entry.oid);
+      }
+    }
+  }
+  return seen;
+}
+
+/**
+ * Objects the client already holds, from its haves: each have commit plus its tree
+ * closure — but the walk stops at the client's shallow boundaries, whose parents the
+ * client does NOT hold. (The closure must not follow parents, or the boundary stop
+ * would be undone: collectReachable([boundary]) re-expands the whole history.)
  */
 function haveObjects(haves: Iterable<string>, shallow: ReadonlySet<string>, objects: ObjectStore): Set<string> {
   const roots: string[] = [];
@@ -207,11 +241,11 @@ function haveObjects(haves: Iterable<string>, shallow: ReadonlySet<string>, obje
     if (shallow.has(oid)) continue; // boundary: the client holds this commit, not its parents
     for (const parent of parseCommit(object.body).parents) queue.push(parent);
   }
-  const held = collectReachable([...roots, ...heldCommits], (oid) => objects.get(oid), { allowMissing: true });
-  return held;
+  return collectTreeClosure([...roots, ...heldCommits], (oid) => objects.get(oid));
 }
 
-function planFetch(args: FetchArgs, objects: ObjectStore): FetchPlan {
+/** Exported for unit tests: compute the fetch plan (objects to send + shallow boundary). */
+export function planFetch(args: FetchArgs, objects: ObjectStore): FetchPlan {
   const shallowSet = new Set(args.shallow);
   const held = haveObjects(args.haves, shallowSet, objects);
   const { commits, tags } = wantCommits(args.wants, args.deepen, objects);
@@ -223,7 +257,7 @@ function planFetch(args: FetchArgs, objects: ObjectStore): FetchPlan {
       sendRoots.push(want);
     }
   }
-  const sendIds = collectReachable(sendRoots, (oid) => objects.get(oid), { allowMissing: true });
+  const sendIds = collectTreeClosure(sendRoots, (oid) => objects.get(oid));
   const send = new Map<string, GitObject>();
   for (const oid of sendIds) {
     if (held.has(oid)) continue;
@@ -427,12 +461,24 @@ export function handleUploadPackV0(body: Buffer, ctx: UploadPackContext): Buffer
   const plan = planFetch({ wants, haves, shallow, deepen }, ctx.objects);
   const pack = buildPack([...plan.send.keys()], ctx.objects);
   const parts: Buffer[] = [];
-  // v0 has no sections: ACK/NAK lines come first as plain pkt-lines, then shallow
-  // lines, then the sideband-framed pack. ACK each have the server holds (NAK only
-  // when none matches); held objects are never re-sent.
+  // v0 has no sections, and a shallow response carries the shallow list TWICE: git's
+  // fetch-pack reads it once right after the wants (a loop that dies with "expected
+  // shallow/unshallow, got ..." on anything but shallow/unshallow lines, ending at
+  // a flush) and once more after "done" (consume_shallow_list, which dies with
+  // "expected shallow list" on anything but shallow/unshallow lines, again ending
+  // at a flush). Only then do the ACK/NAK lines and the sideband pack follow.
+  // ACK each have the server holds (NAK only when none matches); held objects are
+  // never re-sent. Without a deepen there is no shallow list at all: NAK/ACK + pack.
+  const shallowList = (): void => {
+    for (const oid of plan.shallowOut) parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of plan.unshallowOut) parts.push(encodePktLine(`unshallow ${oid}\n`));
+    parts.push(pktLineFlush());
+  };
+  if (deepen !== undefined) {
+    shallowList();
+    shallowList();
+  }
   for (const line of ackLines(haves, ctx.objects)) parts.push(encodePktLine(line));
-  for (const oid of plan.shallowOut) parts.push(encodePktLine(`shallow ${oid}\n`));
-  for (const oid of plan.unshallowOut) parts.push(encodePktLine(`unshallow ${oid}\n`));
   parts.push(encodeSideband(1, pack));
   parts.push(pktLineFlush());
   return Buffer.concat(parts);

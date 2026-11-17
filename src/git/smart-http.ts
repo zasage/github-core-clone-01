@@ -4,13 +4,13 @@
 // arrive from the client); ctx.clockNow() is accepted for callers that need it and is
 // otherwise unused by this layer.
 //
-// Protocol version for GET /info/refs comes from the Git-Protocol request header when
-// the caller passes `headers` (the coordinator's app.ts must forward it); with no header
-// information the upload-pack advertisement defaults to v2, which the suite always
-// requests and which real git clients request by default. POST /git-upload-pack
-// dispatches on the body itself (a leading `command=` line is v2, `want ` is v0), so it
-// needs no header. A missing repository is 404 JSON on both services, and the server
-// keeps serving afterwards.
+// Protocol version for GET /info/refs comes from the Git-Protocol request header, which
+// the caller passes as `headers` (the coordinator's app.ts MUST forward req.headers:
+// the suite's normal client sends `Git-Protocol: version=2` for upload-pack, its v0
+// client sends no header at all, and the two are indistinguishable without it).
+// POST /git-upload-pack dispatches on the body itself (a leading `command=` line is v2,
+// `want ` is v0), so it needs no header. A missing repository is 404 JSON on both
+// services, and the server keeps serving afterwards.
 
 import { ObjectStore } from './objects.ts';
 import { encodePktLine, pktLineFlush } from './protocol.ts';
@@ -102,9 +102,9 @@ function headerValue(headers: Readonly<Record<string, string>> | undefined, name
 
 /**
  * Handle one git smart-HTTP request. `query` carries the URL query (for `service=`),
- * `body` the raw request bytes (empty for GET). `headers` is optional and only used to
- * read `Git-Protocol` on GET /info/refs; when it is absent the upload-pack
- * advertisement defaults to protocol v2.
+ * `body` the raw request bytes (empty for GET). `headers` carries the request headers
+ * and is REQUIRED for a correct upload-pack advertisement: `Git-Protocol: version=2`
+ * selects v2, anything else (including no header) selects v0.
  */
 export function handleGitSmartHttp(
   method: string,
@@ -137,7 +137,7 @@ export function handleGitSmartHttp(
         };
       }
       const protocol = headerValue(headers, 'git-protocol');
-      const wantV2 = protocol === undefined || /version=2/.test(protocol);
+      const wantV2 = protocol !== undefined && /version=2/.test(protocol);
       const advertisement = wantV2
         ? buildUploadPackAdvertisementV2()
         : buildUploadPackAdvertisementV0({ refs, objects });
