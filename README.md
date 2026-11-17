@@ -1,10 +1,10 @@
-# github-core-clone-01 starter
+# github-core-clone-01
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/zasage/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/zasage/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A standalone, GitHub-compatible git forge in one Node 22 process (standard library only, no git binary, no network): git smart HTTP (upload-pack protocol v2, receive-pack v0), the REST v3 API, GraphQL v4, and an MCP endpoint — all over a single in-memory store with a deterministic clock, so a trial's replay is byte-identical.
 
 ## Run it
 
@@ -14,7 +14,7 @@ node --experimental-strip-types main.ts
 
 The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
 own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
+the program imports `node:http` and its own sources only, and the trial has no package manager and
 no internet.
 
 ## The lifecycle (main.ts)
@@ -69,7 +69,15 @@ The trial's CPU, memory and process limits are the rules'; its wall budget is 90
 ## Layout
 
 - `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
+- `app.ts`: the server: one Store, four protocols.
+- `src/store.ts`: the in-memory store (repos, refs, git objects, issues, labels, pulls, comments) with a deterministic clock.
+- `src/rest.ts`: the REST v3 handler.
+- `src/graphql.ts`: the GraphQL v4 handler (hand-written parser + introspection).
+- `src/mcp.ts`: the MCP handler (JSON-RPC 2.0 over Streamable HTTP).
+- `src/git/`: the git layer — object store, packfile parse/generate (delta apply on read), upload-pack v2, receive-pack v0, smart HTTP.
+- `docs/CHECKS.md`: the inventory of the suite's 120 checks, read from the kit's own suite source.
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
 
-The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=w9cz8q8t&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
