@@ -360,7 +360,7 @@ function callCreateIssue(store: Store, args: Record<string, unknown>): ToolOutco
   }
   const body = pickString(args, ['body', 'issue_body', 'description', 'content', 'text', 'comment']);
   const rec = storeCreateIssue(store, fullName, title, body);
-  const out = storeIssueObject(store, rec);
+  const out = storeIssueObject(store, rec, fullName);
   (out as Record<string, unknown>).full_name = fullName;
   return { result: toolResult(out) };
 }
@@ -378,7 +378,7 @@ function callListIssues(store: Store, args: Record<string, unknown>): ToolOutcom
   if (state === 'open') issues = issues.filter((issue) => str(issue.state).toLowerCase() !== 'closed');
   else if (state === 'closed') issues = issues.filter((issue) => str(issue.state).toLowerCase() === 'closed');
   const payload = issues.map((issue) => {
-    const out = storeIssueObject(store, issue);
+    const out = storeIssueObject(store, issue, fullName);
     (out as Record<string, unknown>).full_name = fullName;
     return out;
   });
@@ -406,7 +406,7 @@ function callCreatePullRequest(store: Store, args: Record<string, unknown>): Too
   if (rec === null || error !== null) {
     return { result: toolError(error ?? 'Could not create the pull request') };
   }
-  const out = storePullObject(store, rec);
+  const out = storePullObject(store, rec, fullName);
   (out as Record<string, unknown>).full_name = fullName;
   return { result: toolResult(out) };
 }
@@ -422,8 +422,8 @@ function callMergePullRequest(store: Store, args: Record<string, unknown>): Tool
   if (pull === undefined) {
     return { result: toolError(`Pull request not found: ${fullName}#${pullNumber}`) };
   }
-  const { mergeSha } = storeMergePull(store, pull);
-  const out = storePullObject(store, pull);
+  const { mergeSha } = storeMergePull(store, pull, fullName);
+  const out = storePullObject(store, pull, fullName);
   (out as Record<string, unknown>).full_name = fullName;
   (out as Record<string, unknown>).sha = mergeSha;
   (out as Record<string, unknown>).message = `Merged pull request #${pullNumber}`;

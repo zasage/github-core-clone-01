@@ -20,48 +20,59 @@
 //   unknown repository -> data.repository = null with no errors.
 // The GraphQL parser (tokenizer + recursive-descent document parser) is hand-written; no library.
 //
-// STORE CONTRACT (assumed shape of the Store Worker B writes in src/store.ts — the adapters in
-// section B are the ONLY place that touches the store, so a shape change is fixed there):
-//   store.repos:    Map<string, RepoRecord>            key: full_name "owner/name"
-//   store.refs:     Map<string, string>                key: "owner/name:refs/heads/<branch>" -> sha
-//   store.objects:  Map<string, { type: string, data: Buffer|Uint8Array|string }>  key: sha
-//   store.issues:   Map<string, IssueRecord[]>         key: full_name
-//   store.labels:   Map<string, LabelRecord[]>         key: full_name
-//   store.pulls:    Map<string, PullRecord[]>          key: full_name
-//   store.comments: Map<string, CommentRecord[]>       key: "owner/name#<issueNumber>"
-//   store.viewerLogin?: string                         (the login the token names)
-//   store.now?: () => string                           (deterministic ISO timestamp)
-//   store.nextNumber?: (kind: string) => number        (monotonic counter; only used as a hint)
-//   RepoRecord:   { id, owner, name, full_name, private, description, default_branch,
-//                   created_at, updated_at }
-//   IssueRecord:  { id, number, repo, title, body, state: 'open'|'closed', labels: [],
-//                   created_at, updated_at, closed_at }
-//   PullRecord:   { id, number, repo, title, body, state: 'open'|'closed', merged: boolean,
-//                   head: { ref, sha, label }, base: { ref, sha, label },
-//                   mergeable?: boolean|string, merge_commit_sha, merged_at,
-//                   created_at, updated_at, _gqlFiles?: string[] }
-//   CommentRecord:{ id, repo, issueNumber, body, created_at, updated_at }
+// STORE CONTRACT (the real src/store.ts, written by Worker B — the adapters in section B
+// are the ONLY place that touches the store, so a shape change is fixed there):
+//   store.repos:    Map<string, Repo>                  key: "owner/name"
+//   store.refs:     Map<string, Map<string, string>>   key: "owner/name" -> ("refs/heads/<branch>" -> sha)
+//   store.objects:  ObjectStore (get(oid) -> {type, body: Buffer}, put(type, body) -> oid)
+//   store.issues:   Map<string, Issue[]>              key: "owner/name"
+//   store.labels:   Map<string, Label[]>              key: "owner/name"
+//   store.pulls:    Map<string, Pull[]>               key: "owner/name"
+//   store.comments: Map<string, Comment[]>            key: "owner/name" (Comment carries issueNumber)
+//   store.ownerLogin: string                           (the login the token names: "adaiversen")
+//   store.clock.now(): string                          (deterministic ISO timestamp)
+//   store.nextId(): number                             (global deterministic id counter)
+//   store.nextNumber(repoKey, 'issue' | 'pull'): number (per-repo number counter)
+//   store.createRepo(owner, name, description?, {private?, defaultBranch?}): Repo
+//   Repo:    { id, owner, name, description: string|null, defaultBranch, private,
+//              createdAt, updatedAt }
+//   Issue:   { id, number, title, body, state: 'open'|'closed', labels: string[],
+//              createdAt, updatedAt, closedAt, user: string (login) }
+//   Pull:    { id, number, title, body, state: 'open'|'closed',
+//              head: { ref, sha }, base: { ref, sha }, merged: boolean, mergeable: boolean,
+//              mergeCommitSha, mergedAt, closedAt, createdAt, updatedAt }
+//   Comment: { id, issueNumber, body, createdAt, updatedAt, user: string (login) }
+// Field readers below accept the camelCase names above first and the snake_case spellings
+// as a fallback, so the module also works against a stub store in tests.
 // Global (Relay) ids are opaque base64url strings encoding "kind:payload" (e.g. "R:owner/repo",
 // "I:owner/repo#3", "P:owner/repo#2", "C:owner/repo#3:7"); they are stable across reads and
 // never equal to the plain numeric id/number.
 //
 // VIEWER LOGIN: the suite's scenario seed is a published constant, so the viewer login is the
-// same in every trial ("adaiversen", derived from kit program/env/src/wire.ts SCENARIO_SEED).
-// The primary source is store.viewerLogin (or the owner of any repo already in the store); the
-// constant below is only the last-resort fallback so this module works standalone. If the suite
-// ever changes its scenario seed, set store.viewerLogin instead of relying on the fallback.
+// same in every trial ("adaiversen", derived from kit program/env/src/wire.ts SCENARIO_SEED,
+// and confirmed by docs/CHECKS.md §8 Q1). The primary source is store.ownerLogin; the
+// constant below is only the last-resort fallback so this module works standalone. If the
+// suite ever changes its scenario seed, set store.ownerLogin instead of relying on it.
+//
+// AUTH WIRING (app.ts): handleGraphQL receives no request headers, so the presented bearer
+// must reach it through ctx — pass ctx = { token: <presented bearer> } (compared against
+// ctx.expectedToken ?? process.env.MAKEFUN_SHOP_TOKEN), or ctx = { presentedToken,
+// expectedToken }, or pre-authenticate in app.ts and pass ctx = { authenticated: true }.
+// A request without the right bearer is exactly 401.
 
 import type { Store } from './store.ts';
 import { createHash } from 'node:crypto';
 
 /** The bearer context the handler accepts. */
 export interface GraphQLContext {
-  /** The presented bearer token, or (when presentedToken is absent) the token to check. */
+  /** The presented bearer token (compared against the expected token). */
   token?: string | null;
   /** The presented bearer token, when app.ts passes it separately from the expected token. */
   presentedToken?: string | null;
   /** The expected bearer token, when app.ts passes it explicitly. */
   expectedToken?: string | null;
+  /** True when app.ts already authenticated this request (skips the token check). */
+  authenticated?: boolean;
 }
 
 export interface GraphQLResult {
@@ -115,8 +126,13 @@ interface StoreLike {
   pulls?: unknown;
   comments?: unknown;
   viewerLogin?: unknown;
+  ownerLogin?: unknown;
+  clock?: unknown;
   now?: unknown;
+  nextId?: unknown;
   nextNumber?: unknown;
+  createRepo?: unknown;
+  getRepo?: unknown;
 }
 
 type AnyRecord = Record<string, unknown>;
@@ -138,8 +154,22 @@ function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+/** A timestamp field: camelCase first, snake_case as fallback. */
+function tsOf(rec: AnyRecord, camel: string, snake: string): string {
+  return str(rec[camel] ?? rec[snake]);
+}
+
 /** The deterministic timestamp: the store clock when it has one, else the fallback clock. */
 function nowIso(store: StoreLike): string {
+  const clock = store.clock;
+  if (isRecord(clock) && typeof clock.now === 'function') {
+    try {
+      const value = (clock.now as () => unknown)();
+      if (typeof value === 'string' && value !== '') return value;
+    } catch {
+      // fall through
+    }
+  }
   if (typeof store.now === 'function') {
     try {
       const value = (store.now as () => unknown)();
@@ -151,14 +181,54 @@ function nowIso(store: StoreLike): string {
   return fallbackNow();
 }
 
-/** The login the token names: store.viewerLogin, else any repo's owner, else the fallback. */
+/** The login the token names: store.ownerLogin, else any repo's owner, else the fallback. */
 function viewerLoginOf(store: StoreLike): string {
+  if (typeof store.ownerLogin === 'string' && store.ownerLogin !== '') return store.ownerLogin;
   if (typeof store.viewerLogin === 'string' && store.viewerLogin !== '') return store.viewerLogin;
   for (const repo of allRepos(store)) {
     const owner = str((repo as AnyRecord).owner);
     if (owner !== '') return owner;
   }
   return FALLBACK_VIEWER_LOGIN;
+}
+
+/** The next global deterministic id: store.nextId() when it has one, else max + 1. */
+function nextGlobalId(store: StoreLike): number {
+  if (typeof store.nextId === 'function') {
+    try {
+      const value = (store.nextId as () => unknown)();
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+    } catch {
+      // fall through
+    }
+  }
+  let max = 0;
+  for (const key of ['repos', 'issues', 'labels', 'pulls', 'comments'] as const) {
+    const map = mapOf(store, key);
+    if (map === null) continue;
+    for (const value of map.values()) {
+      if (Array.isArray(value)) {
+        for (const item of value) if (isRecord(item)) max = Math.max(max, num((item as AnyRecord).id));
+      } else if (isRecord(value)) {
+        max = Math.max(max, num((value as AnyRecord).id));
+      }
+    }
+  }
+  return max + 1;
+}
+
+/** The next per-repo issue/pull number: store.nextNumber(repoKey, kind) when it has one. */
+function nextRepoNumber(store: StoreLike, fullName: string, kind: 'issue' | 'pull'): number {
+  if (typeof store.nextNumber === 'function') {
+    try {
+      const value = (store.nextNumber as (key: string, kind: string) => unknown)(fullName, kind);
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+    } catch {
+      // fall through
+    }
+  }
+  const records = kind === 'issue' ? listIssues(store, fullName) : listPulls(store, fullName);
+  return records.reduce((max, item) => Math.max(max, num(item.number)), 0) + 1;
 }
 
 /** All repo records, whatever key the map uses. */
@@ -249,96 +319,57 @@ function listPulls(store: StoreLike, fullName: string): AnyRecord[] {
   return collectForRepo(store, 'pulls', fullName);
 }
 
+/**
+ * Comments for one issue. The real store keys the comments map by repo ("owner/name") and
+ * each comment carries issueNumber; a stub may key by "owner/name#<n>" or store a repo
+ * field on the record instead. All three shapes are read.
+ */
 function listComments(store: StoreLike, fullName: string, issueNumber: number): AnyRecord[] {
   const map = mapOf(store, 'comments');
   if (map === null) return [];
   const out: AnyRecord[] = [];
   const want = fullName.toLowerCase();
   for (const [mapKey, value] of map.entries()) {
-    if (Array.isArray(value)) {
-      if (mapKey.toLowerCase() === `${want}#${issueNumber}`) {
-        for (const item of value) if (isRecord(item)) out.push(item as AnyRecord);
-      } else {
-        for (const item of value) {
-          if (
-            isRecord(item) &&
-            str((item as AnyRecord).repo).toLowerCase() === want &&
-            num((item as AnyRecord).issueNumber ?? (item as AnyRecord).issue_number) === issueNumber
-          ) {
-            out.push(item as AnyRecord);
-          }
+    const key = mapKey.toLowerCase();
+    const items = Array.isArray(value) ? value : isRecord(value) ? [value] : [];
+    if (key === want) {
+      // Repo-keyed (the real store): filter by issueNumber.
+      for (const item of items) {
+        if (isRecord(item) && num((item as AnyRecord).issueNumber ?? (item as AnyRecord).issue_number) === issueNumber) {
+          out.push(item as AnyRecord);
         }
       }
-    } else if (isRecord(value)) {
-      const rec = value as AnyRecord;
-      if (
-        str(rec.repo).toLowerCase() === want &&
-        num(rec.issueNumber ?? rec.issue_number) === issueNumber
-      ) {
-        out.push(rec);
+    } else if (key === `${want}#${issueNumber}`) {
+      for (const item of items) if (isRecord(item)) out.push(item as AnyRecord);
+    } else {
+      for (const item of items) {
+        if (
+          isRecord(item) &&
+          str((item as AnyRecord).repo).toLowerCase() === want &&
+          num((item as AnyRecord).issueNumber ?? (item as AnyRecord).issue_number) === issueNumber
+        ) {
+          out.push(item as AnyRecord);
+        }
       }
     }
   }
   return out;
 }
 
-/** Next numeric REST id across a collection (max + 1, starting at 1). */
-function nextRestId(records: AnyRecord[]): number {
-  let max = 0;
-  for (const rec of records) max = Math.max(max, num(rec.id));
-  return max + 1;
-}
-
-function nextRepoId(store: StoreLike): number {
-  return nextRestId(allRepos(store));
-}
-
-function nextIssueId(store: StoreLike): number {
-  const map = mapOf(store, 'issues');
-  if (map === null) return 1;
-  const all: AnyRecord[] = [];
-  for (const value of map.values()) {
-    if (Array.isArray(value)) for (const item of value) if (isRecord(item)) all.push(item as AnyRecord);
-    else if (isRecord(value)) all.push(value as AnyRecord);
-  }
-  return nextRestId(all);
-}
-
-function nextPullId(store: StoreLike): number {
-  const map = mapOf(store, 'pulls');
-  if (map === null) return 1;
-  const all: AnyRecord[] = [];
-  for (const value of map.values()) {
-    if (Array.isArray(value)) for (const item of value) if (isRecord(item)) all.push(item as AnyRecord);
-    else if (isRecord(value)) all.push(value as AnyRecord);
-  }
-  return nextRestId(all);
-}
-
-function nextCommentId(store: StoreLike): number {
-  const map = mapOf(store, 'comments');
-  if (map === null) return 1;
-  const all: AnyRecord[] = [];
-  for (const value of map.values()) {
-    if (Array.isArray(value)) for (const item of value) if (isRecord(item)) all.push(item as AnyRecord);
-    else if (isRecord(value)) all.push(value as AnyRecord);
-  }
-  return nextRestId(all);
-}
-
-/** The sha a branch ref points at, or null. Tries the flat key, then a per-repo nested map. */
+/** The sha a branch ref points at, or null. The real store nests refs per repo
+ *  (Map<"owner/name", Map<"refs/heads/<branch>", sha>>); a flat map is also read. */
 function getRefSha(store: StoreLike, fullName: string, branch: string): string | null {
   const refs = mapOf(store, 'refs');
   if (refs === null) return null;
-  const flat = refs.get(`${fullName}:refs/heads/${branch}`);
-  if (typeof flat === 'string' && flat !== '') return flat;
-  const flatShort = refs.get(`${fullName}:${branch}`);
-  if (typeof flatShort === 'string' && flatShort !== '') return flatShort;
   const nested = refs.get(fullName);
   if (nested instanceof Map) {
     const sha = nested.get(`refs/heads/${branch}`);
     if (typeof sha === 'string' && sha !== '') return sha;
   }
+  const flat = refs.get(`${fullName}:refs/heads/${branch}`);
+  if (typeof flat === 'string' && flat !== '') return flat;
+  const flatShort = refs.get(`${fullName}:${branch}`);
+  if (typeof flatShort === 'string' && flatShort !== '') return flatShort;
   return null;
 }
 
@@ -353,15 +384,28 @@ function setRefSha(store: StoreLike, fullName: string, branch: string, sha: stri
   refs.set(`${fullName}:refs/heads/${branch}`, sha);
 }
 
-/** One git object: { type, data: Buffer } or null. The stored data may be the bare object
- *  content or the full "<type> <len>\0<content>" bytes; the header is stripped when present. */
+/**
+ * One git object: { type, data: Buffer } or null. The real store.objects is an ObjectStore
+ * (get(oid) -> {type, body: Buffer}); a Map of {type, data|body} is also read. The stored
+ * bytes are the bare object content; a leading "<type> <len>\0" header is stripped if present.
+ */
 function getObject(store: StoreLike, sha: string): { type: string; data: Buffer } | null {
-  const objects = mapOf(store, 'objects');
-  if (objects === null) return null;
-  const value = objects.get(sha);
+  const objects = store.objects;
+  let value: unknown = null;
+  if (objects !== null && typeof objects === 'object' && typeof (objects as { get?: unknown }).get === 'function') {
+    try {
+      value = ((objects as { get: (oid: string) => unknown }).get)(sha);
+    } catch {
+      return null;
+    }
+  } else if (objects instanceof Map) {
+    value = objects.get(sha);
+  } else {
+    return null;
+  }
   if (!isRecord(value)) return null;
   const type = str((value as AnyRecord).type);
-  const raw = (value as AnyRecord).data;
+  const raw = (value as AnyRecord).body ?? (value as AnyRecord).data;
   if (type === '') return null;
   let data: Buffer;
   if (Buffer.isBuffer(raw)) data = raw;
@@ -376,10 +420,19 @@ function getObject(store: StoreLike, sha: string): { type: string; data: Buffer 
   return { type, data };
 }
 
-function putObject(store: StoreLike, sha: string, type: string, data: Buffer): void {
-  const objects = mapOf(store, 'objects');
-  if (objects === null) return;
-  objects.set(sha, { type, data });
+/** Store an object and answer its oid (ObjectStore hashes it; a Map stores it under `sha`). */
+function putObject(store: StoreLike, type: string, data: Buffer, sha?: string): string {
+  const objects = store.objects;
+  if (objects !== null && typeof objects === 'object' && typeof (objects as { put?: unknown }).put === 'function') {
+    const oid = ((objects as { put: (type: string, body: Buffer) => unknown }).put)(type, data);
+    if (typeof oid === 'string' && oid !== '') return oid;
+  }
+  if (objects instanceof Map) {
+    const id = sha ?? createHash('sha1').update(Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data])).digest('hex');
+    objects.set(id, { type, data });
+    return id;
+  }
+  return sha ?? '';
 }
 
 /** The tree sha of a commit object, or null. */
@@ -461,6 +514,75 @@ function isAncestor(store: StoreLike, baseSha: string, headSha: string): boolean
     }
   }
   return false;
+}
+
+/** The parents of a commit object, or [] when it cannot be read. */
+function commitParents(store: StoreLike, commitSha: string): string[] {
+  const obj = getObject(store, commitSha);
+  if (obj === null || obj.type !== 'commit') return [];
+  const parents: string[] = [];
+  for (const line of obj.data.toString('utf8').split('\n')) {
+    if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+    if (line === '') break;
+  }
+  return parents;
+}
+
+/** All ancestors of a tip (including the tip), in walk order. */
+function ancestorsOf(store: StoreLike, tip: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const stack: string[] = [tip];
+  let steps = 0;
+  while (stack.length > 0 && steps < 5000) {
+    steps += 1;
+    const sha = stack.pop() as string;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    out.push(sha);
+    for (const parent of commitParents(store, sha)) stack.push(parent);
+  }
+  return out;
+}
+
+/** The merge base of two tips: the first ancestor of `b` that is also an ancestor of `a`. */
+function mergeBaseOf(store: StoreLike, a: string, b: string): string | null {
+  const aAncestors = new Set(ancestorsOf(store, a));
+  for (const sha of ancestorsOf(store, b)) {
+    if (aAncestors.has(sha)) return sha;
+  }
+  return null;
+}
+
+/**
+ * Whether a pull is conflicted, mirroring REST's pullConflicted: head and base both changed
+ * the same path away from the merge-base to different contents. False when unknowable.
+ */
+function pullConflicted(store: StoreLike, headSha: string, baseSha: string): boolean {
+  try {
+    const base = mergeBaseOf(store, headSha, baseSha);
+    if (base === null) return false;
+    const baseTree = commitTreeSha(store, base);
+    const headTree = commitTreeSha(store, headSha);
+    const tipTree = commitTreeSha(store, baseSha);
+    if (baseTree === null || headTree === null || tipTree === null) return false;
+    const baseFlat = new Map<string, string>();
+    const headFlat = new Map<string, string>();
+    const tipFlat = new Map<string, string>();
+    flattenTree(store, baseTree, '', baseFlat, 0, new Set());
+    flattenTree(store, headTree, '', headFlat, 0, new Set());
+    flattenTree(store, tipTree, '', tipFlat, 0, new Set());
+    const paths = new Set([...headFlat.keys(), ...tipFlat.keys(), ...baseFlat.keys()]);
+    for (const path of paths) {
+      const b = baseFlat.get(path);
+      const h = headFlat.get(path);
+      const t = tipFlat.get(path);
+      if (h !== b && t !== b && h !== t) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -990,16 +1112,16 @@ function repoObject(store: StoreLike, rec: AnyRecord): AnyRecord {
     name: str(rec.name),
     nameWithOwner: fullName,
     owner: { __typename: 'User', login: str(rec.owner) },
-    defaultBranchRef: { __typename: 'Ref', name: str(rec.default_branch), prefix: 'refs/heads/' },
+    defaultBranchRef: { __typename: 'Ref', name: str(rec.defaultBranch ?? rec.default_branch), prefix: 'refs/heads/' },
     viewerPermission: 'ADMIN',
     hasIssuesEnabled: true,
   };
 }
 
-function issueObject(store: StoreLike, rec: AnyRecord): AnyRecord {
-  const fullName = str(rec.repo);
+function issueObject(store: StoreLike, rec: AnyRecord, fullName: string): AnyRecord {
   const number = num(rec.number);
   const state = str(rec.state).toLowerCase() === 'closed' ? 'CLOSED' : 'OPEN';
+  const authorLogin = typeof rec.user === 'string' && rec.user !== '' ? rec.user : viewerLoginOf(store);
   return {
     __typename: 'Issue',
     _record: rec,
@@ -1010,9 +1132,9 @@ function issueObject(store: StoreLike, rec: AnyRecord): AnyRecord {
     state,
     body: str(rec.body),
     url: '',
-    createdAt: str(rec.created_at),
-    updatedAt: str(rec.updated_at),
-    author: { __typename: 'User', login: str(rec.owner) || viewerLoginOf(store) },
+    createdAt: tsOf(rec, 'createdAt', 'created_at'),
+    updatedAt: tsOf(rec, 'updatedAt', 'updated_at'),
+    author: { __typename: 'User', login: authorLogin },
   };
 }
 
@@ -1021,8 +1143,7 @@ function pullStateOf(rec: AnyRecord): string {
   return str(rec.state).toLowerCase() === 'closed' ? 'CLOSED' : 'OPEN';
 }
 
-function pullObject(store: StoreLike, rec: AnyRecord): AnyRecord {
-  const fullName = str(rec.repo);
+function pullObject(store: StoreLike, rec: AnyRecord, fullName: string): AnyRecord {
   const number = num(rec.number);
   const head = isRecord(rec.head) ? (rec.head as AnyRecord) : {};
   const base = isRecord(rec.base) ? (rec.base as AnyRecord) : {};
@@ -1037,33 +1158,55 @@ function pullObject(store: StoreLike, rec: AnyRecord): AnyRecord {
     merged: rec.merged === true,
     headRefName: str(head.ref),
     baseRefName: str(base.ref),
-    mergeable: mergeableOf(store, rec),
+    mergeable: mergeableOf(store, rec, fullName),
     files: { __typename: 'PullRequestChangedFileConnection', _record: rec, _fullName: fullName },
     body: str(rec.body),
-    createdAt: str(rec.created_at),
-    updatedAt: str(rec.updated_at),
+    createdAt: tsOf(rec, 'createdAt', 'created_at'),
+    updatedAt: tsOf(rec, 'updatedAt', 'updated_at'),
     url: '',
   };
 }
 
-/** MERGEABLE when the base tip is an ancestor of the head tip; UNKNOWN when unknowable. */
-function mergeableOf(store: StoreLike, rec: AnyRecord): string {
-  if (rec.merged === true) return 'MERGEABLE';
+/** Live tips for a pull (refs move after creation); falls back to the stored shas. */
+function liveTipsOf(store: StoreLike, rec: AnyRecord, fullName: string): { headSha: string; baseSha: string } {
   const head = isRecord(rec.head) ? (rec.head as AnyRecord) : {};
   const base = isRecord(rec.base) ? (rec.base as AnyRecord) : {};
-  const headSha = str(head.sha);
-  const baseSha = str(base.sha);
+  return {
+    headSha: getRefSha(store, fullName, str(head.ref)) ?? str(head.sha),
+    baseSha: getRefSha(store, fullName, str(base.ref)) ?? str(base.sha),
+  };
+}
+
+/**
+ * MERGEABLE when head and base do not conflict (mirroring REST's pullConflicted over the
+ * merge base); CONFLICTING when they do; UNKNOWN when the objects cannot be read.
+ */
+function mergeableOf(store: StoreLike, rec: AnyRecord, fullName: string): string {
+  if (rec.merged === true) return 'MERGEABLE';
+  if (str(rec.state).toLowerCase() === 'closed') return 'CONFLICTING';
+  const { headSha, baseSha } = liveTipsOf(store, rec, fullName);
   if (headSha === '' || baseSha === '') return 'UNKNOWN';
   try {
-    if (isAncestor(store, baseSha, headSha)) return 'MERGEABLE';
+    if (getObject(store, headSha) === null || getObject(store, baseSha) === null) return 'UNKNOWN';
+    return pullConflicted(store, headSha, baseSha) ? 'CONFLICTING' : 'MERGEABLE';
   } catch {
     return 'UNKNOWN';
   }
-  return 'UNKNOWN';
 }
 
-/** Changed file paths for a pull request: stored list first, else a live tree diff. */
-function pullFiles(store: StoreLike, rec: AnyRecord): string[] {
+/**
+ * Changed file paths for a pull request: a live tree diff over the current branch tips
+ * (like REST's GET /pulls/{n}/files), falling back to the list stored at creation.
+ */
+function pullFiles(store: StoreLike, rec: AnyRecord, fullName: string): string[] {
+  const { headSha, baseSha } = liveTipsOf(store, rec, fullName);
+  try {
+    if (headSha !== '' && getObject(store, headSha) !== null) {
+      return diffPaths(store, baseSha === '' ? null : baseSha, headSha);
+    }
+  } catch {
+    // fall through to the stored list
+  }
   const stored = rec._gqlFiles;
   if (Array.isArray(stored)) return stored.filter((entry): entry is string => typeof entry === 'string');
   const files = rec.files;
@@ -1078,32 +1221,25 @@ function pullFiles(store: StoreLike, rec: AnyRecord): string[] {
     }
     if (paths.length > 0) return paths;
   }
-  const head = isRecord(rec.head) ? (rec.head as AnyRecord) : {};
-  const base = isRecord(rec.base) ? (rec.base as AnyRecord) : {};
-  try {
-    return diffPaths(store, str(base.sha) || null, str(head.sha));
-  } catch {
-    return [];
-  }
+  return [];
 }
 
 // --- Mutations (shared with MCP through the same store records) --------------------------------
+// Records are written in the real store.ts shapes (camelCase) so REST reads them back exactly.
 
 function createIssueRecord(store: StoreLike, fullName: string, title: string, body: string): AnyRecord {
-  const issues = listIssues(store, fullName);
   const now = nowIso(store);
   const rec: AnyRecord = {
-    id: nextIssueId(store),
-    number: issues.reduce((max, item) => Math.max(max, num(item.number)), 0) + 1,
-    repo: fullName,
+    id: nextGlobalId(store),
+    number: nextRepoNumber(store, fullName, 'issue'),
     title,
     body,
     state: 'open',
     labels: [],
-    user: { login: viewerLoginOf(store) },
-    created_at: now,
-    updated_at: now,
-    closed_at: null,
+    createdAt: now,
+    updatedAt: now,
+    closedAt: null,
+    user: viewerLoginOf(store),
   };
   insertForRepo(store, 'issues', fullName, rec);
   return rec;
@@ -1114,29 +1250,27 @@ function createPullRecord(store: StoreLike, fullName: string, title: string, bod
   if (repo === null) return { rec: null, error: `Repository not found: ${fullName}` };
   const headSha = getRefSha(store, fullName, headRef);
   if (headSha === null || headSha === '') return { rec: null, error: `Head branch not found: ${headRef}` };
-  const baseSha = getRefSha(store, fullName, baseRef) ?? '';
-  const pulls = listPulls(store, fullName);
+  const baseSha = getRefSha(store, fullName, baseRef);
+  if (baseSha === null || baseSha === '') return { rec: null, error: `Base branch not found: ${baseRef}` };
   const now = nowIso(store);
-  const owner = str(repo.owner);
   const rec: AnyRecord = {
-    id: nextPullId(store),
-    number: pulls.reduce((max, item) => Math.max(max, num(item.number)), 0) + 1,
-    repo: fullName,
+    id: nextGlobalId(store),
+    number: nextRepoNumber(store, fullName, 'pull'),
     title,
     body,
     state: 'open',
     merged: false,
-    head: { ref: headRef, sha: headSha, label: `${owner}:${headRef}` },
-    base: { ref: baseRef, sha: baseSha, label: `${owner}:${baseRef}` },
+    head: { ref: headRef, sha: headSha },
+    base: { ref: baseRef, sha: baseSha },
     mergeable: true,
-    merge_commit_sha: null,
-    merged_at: null,
-    user: { login: viewerLoginOf(store) },
-    created_at: now,
-    updated_at: now,
+    mergeCommitSha: null,
+    mergedAt: null,
+    closedAt: null,
+    createdAt: now,
+    updatedAt: now,
   };
   try {
-    rec._gqlFiles = diffPaths(store, baseSha === '' ? null : baseSha, headSha);
+    rec._gqlFiles = diffPaths(store, baseSha, headSha);
   } catch {
     rec._gqlFiles = [];
   }
@@ -1147,48 +1281,46 @@ function createPullRecord(store: StoreLike, fullName: string, title: string, bod
 function createCommentRecord(store: StoreLike, fullName: string, issueNumber: number, body: string): AnyRecord {
   const now = nowIso(store);
   const rec: AnyRecord = {
-    id: nextCommentId(store),
-    repo: fullName,
+    id: nextGlobalId(store),
     issueNumber,
-    issue_number: issueNumber,
     body,
-    user: { login: viewerLoginOf(store) },
-    created_at: now,
-    updated_at: now,
+    createdAt: now,
+    updatedAt: now,
+    user: viewerLoginOf(store),
   };
-  insertForRepo(store, 'comments', `${fullName}#${issueNumber}`, rec);
+  // The real store keys comments by repo ("owner/name"); insert under that key, never #n.
+  insertForRepo(store, 'comments', fullName, rec);
   return rec;
 }
 
 /**
  * Squash-merge a pull request: build a squash commit (tree = head tree, parent = base tip),
- * move the default branch ref to it, and mark the pull merged + closed. When the git objects
- * are unavailable the pull is still marked merged/closed with the head sha as the merge sha,
- * so the REST view (merged:true, state closed) stays correct.
+ * move the base branch ref to it, and mark the pull merged + closed — the same fields REST's
+ * merge sets (merged, state closed, mergeCommitSha, mergedAt, closedAt, mergeable false).
+ * When the git objects are unavailable the pull is still marked merged/closed with the head
+ * sha as the merge sha, so the REST view (merged:true, state closed) stays correct.
  */
-function squashMergePull(store: StoreLike, rec: AnyRecord): { mergeSha: string | null; error: string | null } {
-  const fullName = str(rec.repo);
+function squashMergePull(store: StoreLike, rec: AnyRecord, fullName: string): { mergeSha: string | null; error: string | null } {
   const head = isRecord(rec.head) ? (rec.head as AnyRecord) : {};
   const base = isRecord(rec.base) ? (rec.base as AnyRecord) : {};
   const headSha = str(head.sha);
-  const baseSha = str(base.sha);
   const now = nowIso(store);
   let mergeSha: string | null = null;
   try {
     const repo = findRepo(store, fullName.split('/')[0] as string, fullName.split('/').slice(1).join('/'));
-    const defaultBranch = repo === null ? 'main' : str(repo.default_branch) || 'main';
-    const baseTip = getRefSha(store, fullName, str(base.ref) || defaultBranch) ?? baseSha;
+    const defaultBranch = repo === null ? 'main' : str((repo as AnyRecord).defaultBranch ?? (repo as AnyRecord).default_branch) || 'main';
+    const baseRef = str(base.ref) || defaultBranch;
+    const baseTip = getRefSha(store, fullName, baseRef) ?? str(base.sha);
     const treeSha = headSha === '' ? null : commitTreeSha(store, headSha);
     if (treeSha !== null && baseTip !== '') {
       const viewer = viewerLoginOf(store);
       const unix = Math.floor(new Date(now).getTime() / 1000);
       const who = `${viewer} <${viewer}@example.invalid> ${unix} +0000`;
-      const message = `${str(rec.title)}\n`;
-      const commitBody = `tree ${treeSha}\nparent ${baseTip}\nauthor ${who}\ncommitter ${who}\n\n${message}`;
-      const raw = Buffer.concat([Buffer.from(`commit ${Buffer.byteLength(commitBody)}\0`, 'utf8'), Buffer.from(commitBody, 'utf8')]);
-      mergeSha = createHash('sha1').update(raw).digest('hex');
-      putObject(store, mergeSha, 'commit', raw.subarray(raw.indexOf(0x00) + 1));
-      setRefSha(store, fullName, str(base.ref) || defaultBranch, mergeSha);
+      const message = `Merge pull request #${num(rec.number)} from ${str((repo as AnyRecord).owner) ?? viewer}/${str(head.ref)}\n\n${str(rec.title)}`;
+      const commitBody = `tree ${treeSha}\nparent ${baseTip}\nauthor ${who}\ncommitter ${who}\n\n${message}\n`;
+      mergeSha = putObject(store, 'commit', Buffer.from(commitBody, 'utf8'));
+      if (mergeSha !== '') setRefSha(store, fullName, baseRef, mergeSha);
+      else mergeSha = null;
     }
   } catch {
     mergeSha = null;
@@ -1196,9 +1328,11 @@ function squashMergePull(store: StoreLike, rec: AnyRecord): { mergeSha: string |
   if (mergeSha === null) mergeSha = headSha === '' ? null : headSha;
   rec.merged = true;
   rec.state = 'closed';
-  rec.merged_at = now;
-  rec.merge_commit_sha = mergeSha;
-  rec.updated_at = now;
+  rec.mergeable = false;
+  rec.mergedAt = now;
+  rec.mergeCommitSha = mergeSha;
+  rec.closedAt = now;
+  rec.updatedAt = now;
   return { mergeSha, error: null };
 }
 
@@ -1238,11 +1372,11 @@ function resolveField(state: ExecState, parentType: string, parent: AnyRecord | 
         }
         if (decoded.kind === 'I' && decoded.number !== null) {
           const issue = listIssues(state.store, decoded.fullName).find((item) => num(item.number) === decoded.number);
-          return issue === undefined ? null : issueObject(state.store, issue);
+          return issue === undefined ? null : issueObject(state.store, issue, decoded.fullName);
         }
         if (decoded.kind === 'P' && decoded.number !== null) {
           const pull = listPulls(state.store, decoded.fullName).find((item) => num(item.number) === decoded.number);
-          return pull === undefined ? null : pullObject(state.store, pull);
+          return pull === undefined ? null : pullObject(state.store, pull, decoded.fullName);
         }
         return null;
       }
@@ -1264,12 +1398,12 @@ function resolveField(state: ExecState, parentType: string, parent: AnyRecord | 
       const fullName = str((parent as AnyRecord)._fullName);
       if (name === 'issue') {
         const issue = listIssues(state.store, fullName).find((item) => num(item.number) === num(args.number));
-        return issue === undefined ? null : issueObject(state.store, issue);
+        return issue === undefined ? null : issueObject(state.store, issue, fullName);
       }
       if (name === 'issues') return issuesConnection(state, fullName, args);
       if (name === 'pullRequest') {
         const pull = listPulls(state.store, fullName).find((item) => num(item.number) === num(args.number));
-        return pull === undefined ? null : pullObject(state.store, pull);
+        return pull === undefined ? null : pullObject(state.store, pull, fullName);
       }
       if (name === 'pullRequests') return pullsConnection(state, fullName, args);
       // Scalar/object fields (id, databaseId, name, ...) were precomputed on the parent object.
@@ -1290,7 +1424,7 @@ function resolveField(state: ExecState, parentType: string, parent: AnyRecord | 
       if (parentType === 'PullRequest' && name === 'files') {
         const rec = (parent as AnyRecord)._record as AnyRecord;
         const first = typeof args.first === 'number' ? args.first : 100;
-        const paths = pullFiles(state.store, rec).slice(0, first);
+        const paths = pullFiles(state.store, rec, str((parent as AnyRecord)._fullName)).slice(0, first);
         return {
           __typename: 'PullRequestChangedFileConnection',
           nodes: paths.map((path) => ({ __typename: 'PullRequestChangedFile', path, filename: path })),
@@ -1298,7 +1432,7 @@ function resolveField(state: ExecState, parentType: string, parent: AnyRecord | 
           totalCount: paths.length,
         };
       }
-      if (parentType === 'PullRequest' && name === 'mergeable') return mergeableOf(state.store, (parent as AnyRecord)._record as AnyRecord);
+      if (parentType === 'PullRequest' && name === 'mergeable') return mergeableOf(state.store, (parent as AnyRecord)._record as AnyRecord, str((parent as AnyRecord)._fullName));
       if (parentType === 'PullRequest' && name === 'state') return pullStateOf((parent as AnyRecord)._record as AnyRecord);
       return (parent as AnyRecord)[name] ?? null;
     }
@@ -1355,12 +1489,12 @@ function issuesConnection(state: ExecState, fullName: string, args: Record<strin
   const direction = String(orderBy.direction ?? 'ASC').toUpperCase();
   const sorted = [...issues];
   const compareCreated = (a: AnyRecord, b: AnyRecord): number => {
-    const byTime = str(a.created_at).localeCompare(str(b.created_at));
+    const byTime = tsOf(a, 'createdAt', 'created_at').localeCompare(tsOf(b, 'createdAt', 'created_at'));
     if (byTime !== 0) return byTime;
     return num(a.number) - num(b.number);
   };
   const compareUpdated = (a: AnyRecord, b: AnyRecord): number => {
-    const byTime = str(a.updated_at).localeCompare(str(b.updated_at));
+    const byTime = tsOf(a, 'updatedAt', 'updated_at').localeCompare(tsOf(b, 'updatedAt', 'updated_at'));
     if (byTime !== 0) return byTime;
     return num(a.number) - num(b.number);
   };
@@ -1391,10 +1525,10 @@ function issuesConnection(state: ExecState, fullName: string, args: Record<strin
   const startCursor = page.length === 0 ? null : b64urlEncode(`after:${num(page[0]?.number)}`);
   return {
     __typename: 'IssueConnection',
-    nodes: page.map((issue) => issueObject(state.store, issue)),
+    nodes: page.map((issue) => issueObject(state.store, issue, fullName)),
     edges: page.map((issue) => ({
       __typename: 'IssueEdge',
-      node: issueObject(state.store, issue),
+      node: issueObject(state.store, issue, fullName),
       cursor: b64urlEncode(`after:${num(issue.number)}`),
     })),
     pageInfo: { __typename: 'PageInfo', hasNextPage, hasPreviousPage: start > 0, startCursor, endCursor },
@@ -1417,10 +1551,10 @@ function pullsConnection(state: ExecState, fullName: string, args: Record<string
   const page = sorted.slice(0, first);
   return {
     __typename: 'PullRequestConnection',
-    nodes: page.map((pull) => pullObject(state.store, pull)),
+    nodes: page.map((pull) => pullObject(state.store, pull, fullName)),
     edges: page.map((pull) => ({
       __typename: 'PullRequestEdge',
-      node: pullObject(state.store, pull),
+      node: pullObject(state.store, pull, fullName),
       cursor: b64urlEncode(`after:${num(pull.number)}`),
     })),
     pageInfo: { __typename: 'PageInfo', hasNextPage: page.length < sorted.length, hasPreviousPage: false, startCursor: null, endCursor: null },
@@ -1448,7 +1582,7 @@ function resolveMutation(state: ExecState, name: string, args: Record<string, un
       return null;
     }
     const rec = createIssueRecord(state.store, decoded.fullName, title, str(input.body));
-    return { __typename: 'CreateIssuePayload', issue: issueObject(state.store, rec) };
+    return { __typename: 'CreateIssuePayload', issue: issueObject(state.store, rec, decoded.fullName) };
   }
   if (name === 'closeIssue') {
     const decoded = decodeGlobalId(str(input.issueId));
@@ -1463,9 +1597,9 @@ function resolveMutation(state: ExecState, name: string, args: Record<string, un
     }
     const now = nowIso(state.store);
     issue.state = 'closed';
-    issue.closed_at = now;
-    issue.updated_at = now;
-    return { __typename: 'CloseIssuePayload', issue: issueObject(state.store, issue) };
+    issue.closedAt = now;
+    issue.updatedAt = now;
+    return { __typename: 'CloseIssuePayload', issue: issueObject(state.store, issue, decoded.fullName) };
   }
   if (name === 'createPullRequest') {
     const decoded = decodeGlobalId(str(input.repositoryId));
@@ -1485,7 +1619,7 @@ function resolveMutation(state: ExecState, name: string, args: Record<string, un
       state.errors.push({ message: `createPullRequest: ${error ?? 'could not create the pull request'}`, path: [...path, name] });
       return null;
     }
-    return { __typename: 'CreatePullRequestPayload', pullRequest: pullObject(state.store, rec) };
+    return { __typename: 'CreatePullRequestPayload', pullRequest: pullObject(state.store, rec, decoded.fullName) };
   }
   if (name === 'mergePullRequest') {
     const decoded = decodeGlobalId(str(input.pullRequestId));
@@ -1498,8 +1632,8 @@ function resolveMutation(state: ExecState, name: string, args: Record<string, un
       state.errors.push({ message: `mergePullRequest: pull request not found: ${decoded.fullName}#${decoded.number}`, path: [...path, name] });
       return null;
     }
-    squashMergePull(state.store, pull);
-    return { __typename: 'MergePullRequestPayload', pullRequest: pullObject(state.store, pull) };
+    squashMergePull(state.store, pull, decoded.fullName);
+    return { __typename: 'MergePullRequestPayload', pullRequest: pullObject(state.store, pull, decoded.fullName) };
   }
   if (name === 'addComment') {
     const decoded = decodeGlobalId(str(input.subjectId));
@@ -1585,6 +1719,8 @@ function resolveSelectionSet(state: ExecState, parentType: string, parent: AnyRe
 // -----------------------------------------------------------------------------------------------
 
 function checkAuth(ctx: GraphQLContext | undefined): boolean {
+  // app.ts pre-authenticated this request (it owns the socket and the headers).
+  if (ctx?.authenticated === true) return true;
   const presented = ctx?.presentedToken ?? ctx?.token ?? null;
   const expected = ctx?.expectedToken ?? process.env.MAKEFUN_SHOP_TOKEN ?? '';
   if (expected !== '') return presented !== null && presented !== '' && presented === expected;
@@ -1677,26 +1813,52 @@ export function handleGraphQL(bodyJson: unknown, store: Store, ctx: GraphQLConte
 // G. Shared store operations (exported for src/mcp.ts so both surfaces mutate the same records)
 // -----------------------------------------------------------------------------------------------
 
-/** Create a repository record (or return the existing one when the name is taken). */
+/**
+ * Create a repository record (or return the existing one when the name is taken).
+ * Uses the store's own createRepo when it has one, so every per-repo collection and the
+ * number counters are initialized exactly as REST's creation does.
+ */
 export function createRepoRecord(store: Store, owner: string, name: string, description: string, isPrivate: boolean): AnyRecord {
   const like = asStoreLike(store);
   const fullName = `${owner}/${name}`;
   const existing = findRepo(like, owner, name);
   if (existing !== null) return existing;
+  if (typeof like.createRepo === 'function') {
+    try {
+      const created = (like.createRepo as (owner: string, name: string, description: string | null, options: Record<string, unknown>) => unknown)(
+        owner,
+        name,
+        description,
+        { private: isPrivate, defaultBranch: 'main' },
+      );
+      if (isRecord(created)) return created as AnyRecord;
+    } catch {
+      // fall through to the manual record
+    }
+  }
   const now = nowIso(like);
   const rec: AnyRecord = {
-    id: nextRepoId(like),
+    id: nextGlobalId(like),
     owner,
     name,
     full_name: fullName,
     private: isPrivate,
     description,
+    defaultBranch: 'main',
     default_branch: 'main',
+    createdAt: now,
+    updatedAt: now,
     created_at: now,
     updated_at: now,
   };
   const map = mapOf(like, 'repos');
   if (map !== null) map.set(fullName, rec);
+  for (const key of ['refs', 'issues', 'labels', 'pulls', 'comments'] as const) {
+    const collection = mapOf(like, key);
+    if (collection !== null && !collection.has(fullName)) {
+      collection.set(fullName, key === 'refs' ? new Map() : []);
+    }
+  }
   return rec;
 }
 
@@ -1739,8 +1901,8 @@ export function storeCreateComment(store: Store, fullName: string, issueNumber: 
   return createCommentRecord(asStoreLike(store), fullName, issueNumber, body);
 }
 
-export function storeMergePull(store: Store, rec: AnyRecord): { mergeSha: string | null; error: string | null } {
-  return squashMergePull(asStoreLike(store), rec);
+export function storeMergePull(store: Store, rec: AnyRecord, fullName: string): { mergeSha: string | null; error: string | null } {
+  return squashMergePull(asStoreLike(store), rec, fullName);
 }
 
 export function storeRepoObject(store: Store, rec: AnyRecord): AnyRecord {
@@ -1751,17 +1913,17 @@ export function storeRepoObject(store: Store, rec: AnyRecord): AnyRecord {
   return out;
 }
 
-export function storeIssueObject(store: Store, rec: AnyRecord): AnyRecord {
+export function storeIssueObject(store: Store, rec: AnyRecord, fullName: string): AnyRecord {
   const like = asStoreLike(store);
-  const out = issueObject(like, rec);
+  const out = issueObject(like, rec, fullName);
   delete out._record;
   delete out._fullName;
   return out;
 }
 
-export function storePullObject(store: Store, rec: AnyRecord): AnyRecord {
+export function storePullObject(store: Store, rec: AnyRecord, fullName: string): AnyRecord {
   const like = asStoreLike(store);
-  const out = pullObject(like, rec);
+  const out = pullObject(like, rec, fullName);
   delete out._record;
   delete out._fullName;
   return out;
