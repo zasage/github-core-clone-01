@@ -56,6 +56,15 @@ Kompetisi dibuka: 2026-11-14T06:30:00Z. Repo dibuat setelah pembukaan. Prize TID
 - Worker C (api): src/graphql.ts + src/mcp.ts — GraphQL + MCP.
 - Koordinator: wiring app.ts, integrasi, uji lokal, laporan.
 
+## Hasil lokal (koordinator, 2026-11-17) — VERIFIED
+- Suite lokal `sdk/run.ts --perf` (2×, server fresh): **120/120 cek lolos** (git 30/30, repos 15/15, issues 15/15, pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15) — **feature 600, agent 200, perf 184 (run 1) / 187 (run 2), skor 984 / 987, working 1**. Hasil cek identik di kedua run (deterministik).
+- `grade-local --driver process` (trial penuh, commit 09217d9): **status finished, skor 983 (feature 600, agent 200, perf 183), working 1, nondeterministic 0, timeout 0, spend $0**. `l1.reproduced: true`. State export sha256 `a0e98d49…` — **byte-identik dengan export house reference** (calibration.json).
+- Perf lokal vs T_ref: push p50 ~320 ms (T_ref 1641), clone ~106 ms (267), read ~714 ms (2760), write ~131 ms (349) — 2,5–5× lebih cepat dari T_ref di VM ini. Di production (node shared, lebih berisik) akan melambat, tapi margin besar.
+- Uji tambahan: git CLI asli (clone/push/shallow/tag/non-FF) lolos; suite git-client 21/21; REST + GraphQL + MCP 38/38 (Worker C).
+- README sudah pakai template badge make.fun (owner zasage, referral w9cz8q8t); repo About terverifikasi: homepage https://make.fun/bounty/github-core-clone-01, topics [makefun].
+- Koreksi penting selama build: instruksi awal "haves selalu NAK" SALAH — server wajib menghormati haves + thin-pack (CHECKS.md §3/§8); owner token = `adaiversen` (id 1000, diverifikasi via buildScenario()); MCP initialize memakai 2025-11-25 dulu.
+- Sisa untuk parent: bundle transkrip + `makefun check` + submit (JANGAN dilakukan koordinator). Risiko kecil: kode belum diuji di Node 22 persis (VM ini Node 24; server trial Node 22) — hanya stdlib umum yang dipakai, tapi belum ada bukti runtime Node 22.
+
 ## Transcript (W AJIB dipatuhi semua worker)
 - Kerja HANYA di dalam ~/workspace/makefun/github-core-clone-01 (agar sesi terekam sebagai sesi repo ini).
 - Jangan pakai sesi handed-over. Jangan menulis ulang/rebuild sesi.
